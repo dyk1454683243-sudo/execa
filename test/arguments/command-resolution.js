@@ -8,6 +8,7 @@ import path from 'node:path';
 import process from 'node:process';
 import test from 'ava';
 import {execa, execaSync} from '../../index.js';
+import {isCmdShim} from '../../lib/arguments/command-file.js';
 import {setFixtureDirectory, FIXTURES_DIRECTORY} from '../helpers/fixtures-directory.js';
 
 setFixtureDirectory();
@@ -169,6 +170,25 @@ const testNoMutation = async (t, options) => {
 
 test('Does not mutate arguments nor options', testNoMutation, {});
 test('Does not mutate arguments nor options with a shell', testNoMutation, {shell: true});
+
+// Double-escaping is only for cmd-shims: a `node_modules/.bin` path, or the same
+// npm/Yarn/pnpm shim shape (sibling `node.exe` check and `PATHEXT` `.JS` strip).
+test('Detects cmd-shims by node_modules/.bin path', t => {
+	t.true(isCmdShim(path.join('repo', 'node_modules', '.bin', 'eslint.cmd')));
+	t.true(isCmdShim(path.join('repo', 'node_modules', '.bin', 'eslint.bat')));
+	t.true(isCmdShim(String.raw`C:\repo\node_modules\.bin\eslint.cmd`));
+	t.false(isCmdShim(path.join('repo', 'bin', 'eslint.cmd')));
+	t.false(isCmdShim(path.join('repo', 'node_modules', '.bin', 'nested', 'eslint.cmd')));
+});
+
+test('Detects cmd-shim fixtures by contents, not ordinary batch files', t => {
+	t.true(isCmdShim(path.join(FIXTURES_DIRECTORY, 'echo-shim.cmd')));
+	t.true(isCmdShim(path.join(FIXTURES_DIRECTORY, 'echo-shim.bat')));
+	t.true(isCmdShim(path.join(FIXTURES_DIRECTORY, 'echo-cmd-shim.cmd')));
+	t.false(isCmdShim(path.join(FIXTURES_DIRECTORY, 'hello.cmd')));
+	t.false(isCmdShim(path.join(FIXTURES_DIRECTORY, 'args.cmd')));
+	t.false(isCmdShim(path.join(FIXTURES_DIRECTORY, 'echo.js')));
+});
 
 if (isWindows) {
 	const nodeOnlyOptions = {
@@ -344,7 +364,29 @@ if (isWindows) {
 	});
 
 	/*
-	Metacharacters are double-escaped for batch files, since `cmd.exe` interprets them once when the batch file is invoked and once when it re-expands the arguments with `%*`.
+	Ordinary `.cmd` files read `%1`/`%~1` themselves. Double-escaping would leave
+	carets in those arguments (`^"-f^"`), which breaks `if "%~1" == "-f"` — the
+	Maven `mvn.cmd` failure in #1261. They must be single-escaped, unlike cmd-shims.
+	*/
+	test('Ordinary .cmd files reading %~1 get usable arguments', async t => {
+		const filePath = String.raw`C:\repo\pom.xml`;
+		const {stdout} = await execa('args.cmd', ['-f', filePath]);
+		t.is(stdout, `file is ${filePath}`);
+
+		const {stdout: stdoutSync} = execaSync('args.cmd', ['-f', filePath]);
+		t.is(stdoutSync, `file is ${filePath}`);
+	});
+
+	test('Ordinary .cmd files do not receive leftover caret-escaping', async t => {
+		const {stdout} = await execa('args.cmd', ['foo']);
+		t.is(stdout, 'foo');
+
+		const {stdout: stdoutSync} = execaSync('args.cmd', ['foo']);
+		t.is(stdoutSync, 'foo');
+	});
+
+	/*
+	Metacharacters are double-escaped for cmd-shims, since `cmd.exe` interprets them once when the shim is invoked and once when it re-expands the arguments with `%*`.
 	The `cmd`-shims npm generates in `node_modules/.bin/` are the canonical example.
 	*/
 	const setupCmdShim = async () => {
@@ -475,7 +517,7 @@ if (isWindows) {
 	test('Roundtrips arguments with spaces through cmd.exe', testCmdRoundtrip, ['a b', ' '.repeat(3), 'foo bar baz', 'André Cruz']);
 
 	/*
-	`.bat` files re-expand their arguments through `cmd.exe` exactly like `.cmd` files, so they need the same double-escaping.
+	Cmd-shim `.bat` files re-expand `%*` through `cmd.exe` exactly like `.cmd` shims, so they need the same double-escaping.
 	`echo-shim.bat` is the `.bat` twin of `echo-shim.cmd`.
 	*/
 	const testBatEscaping = async (t, commandArgument) => {
@@ -490,7 +532,7 @@ if (isWindows) {
 	test('Does not allow command injection via nested quotes in `.bat` arguments', testBatEscaping, '"& whoami &"');
 	// Metacharacters must survive the double `cmd.exe` expansion for `.bat` files too.
 	test('Roundtrips shell metacharacters through a `.bat` file', testBatEscaping, '(foo|bar>baz|foz)');
-	// A `.bat` file not in `node_modules/.bin/` must still be double-escaped, since the location is irrelevant: any batch file re-expands its arguments.
+	// `echo-shim.bat` is a cmd-shim (it forwards `%*`), so it is still double-escaped even though it is not under `node_modules/.bin`.
 	test('Does not expand environment variables in `.bat` arguments', testBatEscaping, '%PATH%');
 	// Backslashes, double quotes and metacharacters combined are the trickiest to escape, and must survive the double `cmd.exe` expansion of a `.bat` file intact.
 	test('Preserves backslashes, quotes and metacharacters in `.bat` arguments', testBatEscaping, 'a\\"&b\\\\"|c\\');
